@@ -66,7 +66,8 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.nuvio.app"
+        val customAppIdSuffix = providers.gradleProperty("nuvio.android.applicationIdSuffix").orNull ?: ""
+        applicationId = "com.nuvio.app$customAppIdSuffix"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = releaseAppVersionCode
