@@ -1,0 +1,199 @@
+name: Build & Release Fork APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (empty for auto: v<version>-p2p-fix)'
+        required: false
+        type: string
+        default: ''
+      release_title:
+        description: 'Release Title (empty for auto)'
+        required: false
+        type: string
+        default: ''
+      build_type:
+        description: 'Build Type (release/debug)'
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+      prerelease:
+        description: 'Mark as Pre-release'
+        type: boolean
+        default: false
+      draft:
+        description: 'Save as Draft Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Build & Release Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Resolve Version and Tag
+        id: meta
+        run: |
+          version="$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' iosApp/Configuration/Version.xcconfig | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            version="0.6.2"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+          user_tag="${{ inputs.tag_name }}"
+          if [[ -n "${user_tag}" ]]; then
+            tag="${user_tag}"
+          else
+            tag="v${version}-p2p-fix"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+          user_title="${{ inputs.release_title }}"
+          if [[ -n "${user_title}" ]]; then
+            title="${user_title}"
+          else
+            title="Nuvio Mobile v${version} (P2P External Player Fix)"
+          fi
+          echo "title=${title}" >> "${GITHUB_OUTPUT}"
+
+      - name: Configure Keystore & Properties
+        env:
+          KEYSTORE_BASE64: ${{ secrets.NUVIO_RELEASE_KEYSTORE_BASE64 }}
+          LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          # 1. Prepare local.properties
+          if [[ -n "${LOCAL_PROPERTIES_BASE64}" ]]; then
+            printf '%s' "${LOCAL_PROPERTIES_BASE64}" | base64 --decode > local.properties
+            sed -i -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
+          else
+            touch local.properties
+          fi
+
+          # 2. Setup signing keystore for release builds
+          if [[ "${BUILD_TYPE}" == "release" ]]; then
+            keystore_path="${RUNNER_TEMP}/nuvio-release.jks"
+            if [[ -n "${KEYSTORE_BASE64}" ]]; then
+              printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
+            else
+              echo "Generating standalone signing keystore for fork release..."
+              keytool -genkey -v \
+                -keystore "${keystore_path}" \
+                -alias nuvio \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -storepass nuviopassword \
+                -keypass nuviopassword \
+                -dname "CN=NuvioFork, OU=Mobile, O=Nuvio, L=Unknown, S=Unknown, C=US"
+
+              printf '\nNUVIO_RELEASE_STORE_PASSWORD=nuviopassword\n' >> local.properties
+              printf 'NUVIO_RELEASE_KEY_ALIAS=nuvio\n' >> local.properties
+              printf 'NUVIO_RELEASE_KEY_PASSWORD=nuviopassword\n' >> local.properties
+            fi
+            printf 'NUVIO_RELEASE_STORE_FILE=%s\n' "${keystore_path}" >> local.properties
+          fi
+
+      - name: Build Android APK
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          VERSION_NAME: ${{ steps.meta.outputs.version }}
+        run: |
+          if [[ "${BUILD_TYPE}" == "release" ]]; then
+            ./gradlew :androidApp:assembleFullRelease \
+              -Pnuvio.android.distribution=full \
+              -Pnuvio.app.versionName="${VERSION_NAME}" \
+              --stacktrace
+          else
+            ./gradlew :androidApp:assembleFullDebug \
+              -Pnuvio.android.distribution=full \
+              -Pnuvio.app.versionName="${VERSION_NAME}" \
+              --stacktrace
+          fi
+
+      - name: Collect APK Files
+        id: collect
+        run: |
+          mkdir -p dist
+          find androidApp/build/outputs/apk/full -name "*.apk" -type f -exec cp {} dist/ \;
+          echo "Generated APKs:"
+          ls -lh dist/
+
+      - name: Generate Release Notes
+        run: |
+          cat << 'EOF' > release-notes.md
+          ## Nuvio Mobile - Fork Build
+
+          ### Changes in this build:
+          EOF
+
+          # List commits unique to this branch compared to cmp-rewrite (or last 5 commits fallback)
+          if git rev-parse --verify --quiet origin/cmp-rewrite >/dev/null 2>&1; then
+            git log origin/cmp-rewrite..HEAD --pretty=format:"* %s (%h)" >> release-notes.md || true
+          else
+            git log -n 5 --pretty=format:"* %s (%h)" >> release-notes.md
+          fi
+          echo "" >> release-notes.md
+          cat release-notes.md
+
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-fork-apks
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: ${{ steps.meta.outputs.title }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          # If tag exists, delete it first so re-running overwrites cleanly
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists, uploading assets to it..."
+            gh release upload "${TAG}" dist/*.apk --clobber
+          else
+            extra_args=()
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              extra_args+=(--prerelease)
+            fi
+            if [[ "${DRAFT}" == "true" ]]; then
+              extra_args+=(--draft)
+            fi
+
+            gh release create "${TAG}" dist/*.apk \
+              --title "${TITLE}" \
+              --notes-file release-notes.md \
+              "${extra_args[@]}"
+          fi
+
